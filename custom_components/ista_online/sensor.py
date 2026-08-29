@@ -1,10 +1,41 @@
+"""Sensor platform for the ista Online integration.
+
+MODIFIED from the upstream project by Jeppe Leth (Apache-2.0):
+https://github.com/JeppeLeth/hass-ista-online
+
+Changes in this fork:
+  - Meter values are coerced to float, including Danish decimal commas
+    ("1.234,5"). Upstream passed the raw API string straight through, which
+    Home Assistant rejects for a numeric sensor.
+  - Device class is inferred from the unit when the meter-type string is not
+    one of the four literals upstream recognised, so heat meters reporting
+    e.g. "VARME" or "HEAT" still land in the Energy dashboard.
+  - State classes corrected. The meter register is `total_increasing` and is
+    the correct Energy dashboard source; the period consumption figure is a
+    delta, so it carries no state class rather than being mislabelled
+    `total_increasing` (which would treat every new period as a meter reset
+    and corrupt long-term statistics).
+  - Shared behaviour lifted into a base class instead of repeated per sensor.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorStateClass,
+)
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.components.sensor import SensorEntity, SensorDeviceClass
+
 from .const import DOMAIN
-from typing import Any, Optional
-from datetime import datetime, timezone
-import re
+
+_LOGGER = logging.getLogger(__name__)
 
 DIAGNOSTIC_FIELDS = {
     "Activation date": "Activation_date",
@@ -22,100 +53,159 @@ USER_INFO_DIAGNOSTIC_FIELDS = {
     "Address Zip": "ZipCity",
 }
 
+WATER_METER_TYPES = {"CW", "HW", "KV", "VV", "WATER", "VAND", "KOLDTVAND", "VARMTVAND"}
+ENERGY_METER_TYPES = {
+    "ENERGY", "ELECTRICITY", "HEAT", "HEATING", "VARME", "FJERNVARME", "EL",
+}
+
+WATER_UNITS = {"m³", "L", "ft³", "gal"}
+ENERGY_UNITS = {"Wh", "kWh", "MWh", "GJ"}
+
+UNIT_ALIASES = {
+    "m3": "m³",
+    "m^3": "m³",
+    "kwh": "kWh",
+    "mwh": "MWh",
+    "wh": "Wh",
+    "gj": "GJ",
+    "l": "L",
+}
 
 
-def _map_device_class(meter_type: Any):
-    mt = (str(meter_type) if meter_type else "").upper()
-    if mt in ("CW", "HW"):
+def _normalize_unit(unit: Any) -> str | None:
+    """Map the API's unit spelling onto Home Assistant's."""
+    if not isinstance(unit, str):
+        return None
+    cleaned = unit.strip()
+    return UNIT_ALIASES.get(cleaned.lower(), cleaned) or None
+
+
+def _to_float(value: Any) -> float | None:
+    """Coerce an API value to float, tolerating Danish number formatting."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip().replace(" ", "").replace(" ", "")
+    if not text:
+        return None
+
+    if "," in text and "." in text:
+        # "1.234,5" -> dot is the thousands separator.
+        text = text.replace(".", "").replace(",", ".")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    try:
+        return float(text)
+    except ValueError:
+        _LOGGER.debug("Could not parse %r as a number", value)
+        return None
+
+
+def _map_device_class(meter_type: Any, unit: str | None) -> SensorDeviceClass | None:
+    """Infer device class from the meter type, falling back to the unit."""
+    normalized = (str(meter_type) if meter_type else "").strip().upper()
+    if normalized in WATER_METER_TYPES:
         return SensorDeviceClass.WATER
-    if mt == "ENERGY":
+    if normalized in ENERGY_METER_TYPES:
         return SensorDeviceClass.ENERGY
-    if mt == "ELECTRICITY":
+
+    # The meter-type vocabulary is not documented, so let the unit decide when
+    # the string is unfamiliar. Logged at debug so unknown types can be added.
+    if unit in WATER_UNITS:
+        _LOGGER.debug("Meter type %r unknown; using unit %s -> water", meter_type, unit)
+        return SensorDeviceClass.WATER
+    if unit in ENERGY_UNITS:
+        _LOGGER.debug("Meter type %r unknown; using unit %s -> energy", meter_type, unit)
         return SensorDeviceClass.ENERGY
+
+    _LOGGER.debug("No device class for meter type %r with unit %r", meter_type, unit)
     return None
 
 
-def _normalize_unit(unit: Any) -> Any:
-    if isinstance(unit, str):
-        if unit.lower() == "m3":
-            return "m³"
-        if unit.lower() == "kwh":
-            return "kWh"
-    return unit
-
-def _suggest_precision_for_unit(native_unit: str | None) -> int | None:
-    """Return suggested precision for known units."""
-    if native_unit == "m³":
-        return 3
-    return None
-
-
-def _parse_date_string(value: Any) -> Optional[datetime]:
+def _parse_date_string(value: Any) -> datetime | None:
     if not value or not isinstance(value, str):
         return None
+    text = value.strip()
     try:
-        # Reading_date is in format "23-07-2025"
-        if re.match(r"\d{2}-\d{2}-\d{4}$", value.strip()):
-            dt = datetime.strptime(value.strip(), "%d-%m-%Y")
-            return dt.replace(tzinfo=timezone.utc)
-        s = value.strip()
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
+        if re.match(r"\d{2}-\d{2}-\d{4}$", text):
+            return datetime.strptime(text, "%d-%m-%Y").replace(tzinfo=timezone.utc)
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
         return None
 
 
-class MeterSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, meter: dict, user_info: dict):
+class ISTAMeterEntity(CoordinatorEntity, SensorEntity):
+    """Common plumbing: device grouping and refreshing this meter's payload."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, meter: dict, user_info: dict) -> None:
         super().__init__(coordinator)
         self._meter = meter or {}
         self._user_info = user_info or {}
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        self._unique_id = f"ista_meter_{serial}_last_meter_reading"
+        self._meter_id = self._meter.get("METER_ID")
 
     @property
-    def unique_id(self) -> str:
-        return self._unique_id
-
-    @property
-    def name(self) -> str:
-        return "Last Meter Reading"
-
-    @property
-    def native_value(self) -> Any:
-        return self._meter.get("Last_Meter_Reading")
-
-    @property
-    def native_unit_of_measurement(self) -> Any:
-        return _normalize_unit(self._meter.get("Unit"))
-    
-    @property
-    def native_precision(self) -> int | None:
-        return _suggest_precision_for_unit(self.native_unit_of_measurement)
-
-    @property
-    def device_class(self):
-        return _map_device_class(self._meter.get("MeterType"))
-
-    @property
-    def state_class(self) -> str:
-        return "total"
+    def _serial(self) -> Any:
+        return self._meter.get("METER_NO") or self._meter.get("METER_ID")
 
     @property
     def device_info(self) -> DeviceInfo:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        model = self._meter.get("METCAT_LABEL") or ""
         return DeviceInfo(
-            identifiers={(DOMAIN, str(serial))},
+            identifiers={(DOMAIN, str(self._serial))},
             manufacturer="ISTA",
-            serial_number=serial,
-            name=f"Meter {serial}",
-            model=model,
+            serial_number=str(self._serial),
+            name=f"Meter {self._serial}",
+            model=self._meter.get("METCAT_LABEL") or "",
         )
+
+    def _handle_coordinator_update(self) -> None:
+        meters = (self.coordinator.data or {}).get("meters") or {}
+        for meter in (meters.get("Meters") or {}).get("Value") or []:
+            if str(meter.get("METER_ID")) == str(self._meter_id):
+                self._meter = meter
+                break
+        self._user_info = (self.coordinator.data or {}).get("user_info") or {}
+        self.async_write_ha_state()
+
+
+class MeterReadingSensor(ISTAMeterEntity):
+    """The meter register. This is the entity to use in the Energy dashboard."""
+
+    _attr_name = "Last meter reading"
+    _attr_state_class = SensorStateClass.TOTAL_INCREASING
+
+    def __init__(self, coordinator, meter: dict, user_info: dict) -> None:
+        super().__init__(coordinator, meter, user_info)
+        self._attr_unique_id = f"ista_meter_{self._serial}_last_meter_reading"
+
+    @property
+    def native_value(self) -> float | None:
+        return _to_float(self._meter.get("Last_Meter_Reading"))
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        return _normalize_unit(self._meter.get("Unit"))
+
+    @property
+    def device_class(self) -> SensorDeviceClass | None:
+        return _map_device_class(
+            self._meter.get("MeterType"), self.native_unit_of_measurement
+        )
+
+    @property
+    def suggested_display_precision(self) -> int | None:
+        return 3 if self.native_unit_of_measurement == "m³" else None
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -123,66 +213,36 @@ class MeterSensor(CoordinatorEntity, SensorEntity):
             "address": self._user_info.get("Address"),
             "city": self._user_info.get("ZipCity"),
             "room_description": self._meter.get("ROOM_DESCR"),
+            "reading_date": self._meter.get("Reading_date"),
         }
-        return {k: v for k, v in attrs.items() if v is not None}
-
-    def _handle_coordinator_update(self) -> None:
-        meters = self.coordinator.data.get("meters", {}) or {}
-        meters_value = (meters.get("Meters") or {}).get("Value") or []
-        for m in meters_value:
-            if str(m.get("METER_ID")) == str(self._meter.get("METER_ID")):
-                self._meter = m
-                break
-        self.async_write_ha_state()
+        return {key: value for key, value in attrs.items() if value is not None}
 
 
-class MeterConsumptionSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, meter: dict, user_info: dict):
-        super().__init__(coordinator)
-        self._meter = meter or {}
-        self._user_info = user_info or {}
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        self._unique_id = f"ista_meter_{serial}_last_meter_consumption"
+class MeterConsumptionSensor(ISTAMeterEntity):
+    """Consumption for the last billing period.
+
+    Deliberately carries no state class: this is a per-period delta, not a
+    cumulative total, so `total_increasing` would read every new period as a
+    meter reset. Use the reading sensor for the Energy dashboard.
+    """
+
+    _attr_name = "Last meter consumption"
+
+    def __init__(self, coordinator, meter: dict, user_info: dict) -> None:
+        super().__init__(coordinator, meter, user_info)
+        self._attr_unique_id = f"ista_meter_{self._serial}_last_meter_consumption"
 
     @property
-    def unique_id(self) -> str:
-        return self._unique_id
+    def native_value(self) -> float | None:
+        return _to_float(self._meter.get("Last_Meter_Consumption"))
 
     @property
-    def name(self) -> str:
-        return "Last Meter Consumption"
-
-    @property
-    def native_value(self) -> Any:
-        return self._meter.get("Last_Meter_Consumption")
-
-    @property
-    def native_unit_of_measurement(self) -> Any:
+    def native_unit_of_measurement(self) -> str | None:
         return _normalize_unit(self._meter.get("Unit"))
 
     @property
-    def native_precision(self) -> int | None:
-        return _suggest_precision_for_unit(self.native_unit_of_measurement)
-
-    @property
-    def device_class(self):
-        return _map_device_class(self._meter.get("MeterType"))
-
-    @property
-    def state_class(self) -> str:
-        return "total_increasing"
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        model = self._meter.get("METCAT_LABEL") or ""
-        return DeviceInfo(
-            identifiers={(DOMAIN, str(serial))},
-            manufacturer="ISTA",
-            serial_number=serial,
-            name=f"Meter {serial}",
-            model=model,
-        )
+    def suggested_display_precision(self) -> int | None:
+        return 3 if self.native_unit_of_measurement == "m³" else None
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -190,143 +250,82 @@ class MeterConsumptionSensor(CoordinatorEntity, SensorEntity):
             "address": self._user_info.get("Address"),
             "city": self._user_info.get("ZipCity"),
         }
-        return {k: v for k, v in attrs.items() if v is not None}
-
-    def _handle_coordinator_update(self) -> None:
-        meters = self.coordinator.data.get("meters", {}) or {}
-        meters_value = (meters.get("Meters") or {}).get("Value") or []
-        for m in meters_value:
-            if str(m.get("METER_ID")) == str(self._meter.get("METER_ID")):
-                self._meter = m
-                break
-        self.async_write_ha_state()
+        return {key: value for key, value in attrs.items() if value is not None}
 
 
-class MeterDiagnosticSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, meter: dict, user_info: dict, display_name: str, field_key: str):
-        super().__init__(coordinator)
-        self._meter = meter or {}
-        self._user_info = user_info or {}
+class MeterDiagnosticSensor(ISTAMeterEntity):
+    """A raw field off the meter payload, for troubleshooting."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self, coordinator, meter: dict, user_info: dict, display_name: str, field_key: str
+    ) -> None:
+        super().__init__(coordinator, meter, user_info)
         self._field_key = field_key
-        self._display_name = display_name
-        self._unique_id = f"{self._meter.get('METER_ID')}_{field_key}"
-
-    @property
-    def unique_id(self) -> str:
-        return self._unique_id
-
-    @property
-    def name(self) -> str:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        return f"Meter {serial} {self._display_name}"
+        self._attr_name = display_name
+        self._attr_unique_id = f"ista_meter_{self._serial}_{field_key}"
 
     @property
     def native_value(self) -> Any:
-        # parse dates for certain fields
+        value = self._meter.get(self._field_key)
         if self._field_key in ("Reading_date", "Activation_date", "Deactivation_date"):
-            dt = _parse_date_string(self._meter.get(self._field_key))
-            if dt:
-                return dt.isoformat()
-        return self._meter.get(self._field_key)
-
-    @property
-    def native_unit_of_measurement(self) -> Any:
-        return None
-
-    @property
-    def device_class(self) -> Optional[str]:
-        if self._field_key in ("Reading_date", "Activation_date", "Deactivation_date"):
-            return None
-        return None
-
-    @property
-    def entity_category(self) -> Any:
-        return EntityCategory.DIAGNOSTIC
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        model = self._meter.get("METCAT_LABEL") or ""
-        return DeviceInfo(
-            identifiers={(DOMAIN, str(serial))},
-            manufacturer="ISTA",
-            serial_number=serial,
-            name=f"Meter {serial}",
-            model=model,
-        )
-
-    def _handle_coordinator_update(self) -> None:
-        meters = self.coordinator.data.get("meters", {}) or {}
-        meters_value = (meters.get("Meters") or {}).get("Value") or []
-        for m in meters_value:
-            if str(m.get("METER_ID")) == str(self._meter.get("METER_ID")):
-                self._meter = m
-                break
-        self.async_write_ha_state()
+            parsed = _parse_date_string(value)
+            if parsed:
+                return parsed.isoformat()
+        return value
 
 
-class UserInfoDiagnosticSensor(CoordinatorEntity, SensorEntity):
-    def __init__(self, coordinator, meter: dict, user_info: dict, display_name: str, user_field_key: str):
-        super().__init__(coordinator)
-        self._meter = meter or {}
-        self._user_info = user_info or {}
-        self._display_name = display_name
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        key = user_field_key.lower().replace(" ", "_")
-        self._field_key = user_field_key
-        self._unique_id = f"ista_meter_{serial}_{key}"
+class UserInfoDiagnosticSensor(ISTAMeterEntity):
+    """An account-level field, attached to each meter's device."""
 
-    @property
-    def unique_id(self) -> str:
-        return self._unique_id
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
-    @property
-    def name(self) -> str:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        return f"Meter {serial} {self._display_name}"
+    def __init__(
+        self, coordinator, meter: dict, user_info: dict, display_name: str, field_key: str
+    ) -> None:
+        super().__init__(coordinator, meter, user_info)
+        self._field_key = field_key
+        self._attr_name = display_name
+        key = field_key.lower().replace(" ", "_")
+        self._attr_unique_id = f"ista_meter_{self._serial}_{key}"
 
     @property
     def native_value(self) -> Any:
         return self._user_info.get(self._field_key)
 
-    @property
-    def native_unit_of_measurement(self) -> Any:
-        return None
 
-    @property
-    def entity_category(self) -> Any:
-        return EntityCategory.DIAGNOSTIC
-
-    @property
-    def device_info(self) -> DeviceInfo:
-        serial = self._meter.get("METER_NO") or self._meter.get("METER_ID")
-        model = self._meter.get("METCAT_LABEL") or ""
-        return DeviceInfo(
-            identifiers={(DOMAIN, str(serial))},
-            manufacturer="ISTA",
-            serial_number=serial,
-            name=f"Meter {serial}",
-            model=model,
-        )
-
-    def _handle_coordinator_update(self) -> None:
-        # nothing special; just refresh
-        self.async_write_ha_state()
-
-
-async def async_setup_entry(hass, entry, async_add_entities):
-    from .const import DOMAIN  # avoid circular if needed
+async def async_setup_entry(hass, entry, async_add_entities) -> None:
+    """Set up sensors for each meter on the account."""
     coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
     if not coordinator:
         return
-    meters = (coordinator.data.get("meters") or {}).get("Meters", {}).get("Value", [])
-    user_info = coordinator.data.get("user_info", {})
-    entities = []
-    for m in meters:
-        entities.append(MeterSensor(coordinator, m, user_info))
-        entities.append(MeterConsumptionSensor(coordinator, m, user_info))
+
+    data = coordinator.data or {}
+    meters = ((data.get("meters") or {}).get("Meters") or {}).get("Value") or []
+    user_info = data.get("user_info") or {}
+
+    if not meters:
+        _LOGGER.warning("ista returned no meters for this account")
+        return
+
+    entities: list[SensorEntity] = []
+    for meter in meters:
+        _LOGGER.debug(
+            "Adding ista meter %s (type=%r, unit=%r)",
+            meter.get("METER_NO"),
+            meter.get("MeterType"),
+            meter.get("Unit"),
+        )
+        entities.append(MeterReadingSensor(coordinator, meter, user_info))
+        entities.append(MeterConsumptionSensor(coordinator, meter, user_info))
         for display_name, key in DIAGNOSTIC_FIELDS.items():
-            entities.append(MeterDiagnosticSensor(coordinator, m, user_info, display_name, key))
+            entities.append(
+                MeterDiagnosticSensor(coordinator, meter, user_info, display_name, key)
+            )
         for display_name, key in USER_INFO_DIAGNOSTIC_FIELDS.items():
-            entities.append(UserInfoDiagnosticSensor(coordinator, m, user_info, display_name, key))
-    async_add_entities(entities, True)
+            entities.append(
+                UserInfoDiagnosticSensor(coordinator, meter, user_info, display_name, key)
+            )
+
+    async_add_entities(entities)

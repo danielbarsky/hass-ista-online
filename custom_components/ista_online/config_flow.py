@@ -1,118 +1,217 @@
-from homeassistant import config_entries
+"""Config flow for the ista Online integration.
+
+MODIFIED from the upstream project by Jeppe Leth (Apache-2.0):
+https://github.com/JeppeLeth/hass-ista-online
+
+Changes in this fork:
+  - Reauthentication works. Upstream read the entry from `context["entry"]`,
+    which current Home Assistant does not set, so the flow always aborted with
+    `no_entry` and the integration had to be deleted and re-added.
+  - `async_get_options_flow` is a proper static method taking the config entry,
+    instead of an instance method that Home Assistant called with the entry
+    bound to `self`.
+  - The config entry gets a unique ID, so the same account cannot be added twice.
+  - The API base URL is overridable, and auth errors are distinguished from
+    connection errors in the UI.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
 import voluptuous as vol
-from .const import DOMAIN, COUNTRY_OPTIONS, DEFAULT_COUNTRY
-from typing import Any, Dict
-from .api_client import fetch_token, TokenSuccess
+
+from homeassistant import config_entries
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .api_client import IstaApiError, IstaAuthError, async_fetch_token
+from .const import (
+    CONF_BASE_URL,
+    CONF_COUNTRY,
+    COUNTRY_OPTIONS,
+    DEFAULT_COUNTRY,
+    DOMAIN,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def _async_validate(hass, base_url: str, username: str, password: str) -> str | None:
+    """Return None if the credentials work, else an error key for the form."""
+    session = async_get_clientsession(hass)
+    try:
+        await async_fetch_token(session, base_url, username, password)
+    except IstaAuthError:
+        return "invalid_auth"
+    except IstaApiError as err:
+        _LOGGER.debug("ista connection check failed: %s", err)
+        return "cannot_connect"
+    return None
+
+
+def _credentials_schema(
+    *, country: str | None = None, username: str = "", base_url: str | None = None,
+    include_country: bool = True,
+) -> vol.Schema:
+    fields: dict[Any, Any] = {}
+    if include_country:
+        fields[
+            vol.Required(CONF_COUNTRY, default=country or DEFAULT_COUNTRY)
+        ] = vol.In(list(COUNTRY_OPTIONS))
+    fields[vol.Required("username", default=username)] = str
+    fields[vol.Required("password")] = str
+    if include_country:
+        fields[
+            vol.Optional(
+                CONF_BASE_URL,
+                default=base_url or COUNTRY_OPTIONS[country or DEFAULT_COUNTRY],
+            )
+        ] = str
+    return vol.Schema(fields)
+
 
 class ISTAConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle the initial setup and reauthentication."""
+
     VERSION = 1
-    CONNECTION_CLASS = config_entries.CONN_CLASS_CLOUD_POLL
 
-    def __init__(self):
-        self._data: Dict[str, Any] = {}
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> Any:
+        errors: dict[str, str] = {}
 
-    async def async_step_user(self, user_input: Dict[str, Any] = None):
-        errors: Dict[str, str] = {}
         if user_input is not None:
-            country = user_input.get("country")
-            username = user_input.get("username")
-            password = user_input.get("password")
-            if not country or not username or not password:
-                errors["base"] = "missing_fields"
+            country = user_input[CONF_COUNTRY]
+            username = user_input["username"]
+            password = user_input["password"]
+            base_url = (user_input.get(CONF_BASE_URL) or "").strip() or COUNTRY_OPTIONS[
+                country
+            ]
+
+            await self.async_set_unique_id(username.strip().lower())
+            self._abort_if_unique_id_configured()
+
+            error = await _async_validate(self.hass, base_url, username, password)
+            if error:
+                errors["base"] = error
             else:
-                base_url = COUNTRY_OPTIONS.get(country)
-                if not base_url:
-                    errors["country"] = "invalid_country"
-                else:
-                    token_res = await self.hass.async_add_executor_job(fetch_token, base_url, username, password)
-                    if not isinstance(token_res, TokenSuccess):
-                        errors["base"] = "auth_failed"
-                    else:
-                        title = f"ISTA user {username}"
-                        return self.async_create_entry(
-                            title=title,
-                            data={"country": country, "username": username, "password": password},
-                        )
+                return self.async_create_entry(
+                    title=f"ISTA {username}",
+                    data={
+                        CONF_COUNTRY: country,
+                        CONF_BASE_URL: base_url,
+                        "username": username,
+                        "password": password,
+                    },
+                )
 
-        schema = vol.Schema(
-            {
-                vol.Required("country", default=self._data.get("country", DEFAULT_COUNTRY)): vol.In(list(COUNTRY_OPTIONS.keys())),
-                vol.Required("username", default=self._data.get("username", "")): str,
-                vol.Required("password"): str,
-            }
+        return self.async_show_form(
+            step_id="user", data_schema=_credentials_schema(), errors=errors
         )
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
 
-    async def async_step_reauth(self, user_input: Dict[str, Any] = None):
-        entry: ConfigEntry = self.context.get("entry")
-        if not entry:
-            return self.async_abort(reason="no_entry")
+    def _reauth_entry(self) -> ConfigEntry | None:
+        """Resolve the entry being reauthenticated across HA versions."""
+        entry_id = self.context.get("entry_id")
+        if entry_id:
+            return self.hass.config_entries.async_get_entry(entry_id)
+        return self.context.get("entry")
 
-        errors: Dict[str, str] = {}
+    async def async_step_reauth(self, entry_data: dict[str, Any] | None = None) -> Any:
+        """Entry point when the coordinator raises ConfigEntryAuthFailed."""
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> Any:
+        entry = self._reauth_entry()
+        if entry is None:
+            return self.async_abort(reason="reauth_entry_missing")
+
+        errors: dict[str, str] = {}
         stored = dict(entry.data)
+
         if user_input is not None:
-            username = user_input.get("username")
-            password = user_input.get("password")
-            country = stored.get("country", DEFAULT_COUNTRY)
-            if not country or not username or not password:
-                errors["base"] = "missing_fields"
+            username = user_input["username"]
+            password = user_input["password"]
+            country = stored.get(CONF_COUNTRY, DEFAULT_COUNTRY)
+            base_url = stored.get(CONF_BASE_URL) or COUNTRY_OPTIONS.get(
+                country, COUNTRY_OPTIONS[DEFAULT_COUNTRY]
+            )
+
+            error = await _async_validate(self.hass, base_url, username, password)
+            if error:
+                errors["base"] = error
             else:
-                base_url = COUNTRY_OPTIONS.get(country)
-                if not base_url:
-                    errors["country"] = "invalid_country"
-                else:
-                    token_res = await self.hass.async_add_executor_job(fetch_token, base_url, username, password)
-                    if not isinstance(token_res, TokenSuccess):
-                        errors["base"] = "auth_failed"
-                    else:
-                        new_data = {"country": country, "username": username, "password": password}
-                        self.hass.config_entries.async_update_entry(entry, data=new_data)
-                        return self.async_abort(reason="reauth_successful")
+                # The update listener registered in async_setup_entry reloads
+                # the entry; reloading here as well would race with it.
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        **stored,
+                        "username": username,
+                        "password": password,
+                    },
+                )
+                return self.async_abort(reason="reauth_successful")
 
-        schema = vol.Schema(
-            {
-                vol.Required("username", default=stored.get("username", "")): str,
-                vol.Required("password"): str,
-            }
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=_credentials_schema(
+                username=stored.get("username", ""), include_country=False
+            ),
+            errors=errors,
         )
-        return self.async_show_form(step_id="reauth", data_schema=schema, errors=errors)
 
-    def async_get_options_flow(self):
-        return OptionsFlowHandler(self)
+    @staticmethod
+    @callback
+    def async_get_options_flow(
+        config_entry: ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(config_entries.OptionsFlow):
-    def __init__(self, config_flow: ISTAConfigFlow):
-        self.config_flow = config_flow
+    """Let the user update credentials or the API endpoint after setup."""
 
-    async def async_step_init(self, user_input: Dict[str, Any] = None):
-        errors: Dict[str, str] = {}
-        current = self.config_entry.data if self.config_entry else {}
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> Any:
+        entry = self.config_entry
+        errors: dict[str, str] = {}
+        stored = dict(entry.data)
+
         if user_input is not None:
-            country = user_input.get("country")
-            username = user_input.get("username")
-            password = user_input.get("password")
-            if not country or not username or not password:
-                errors["base"] = "missing_fields"
-            else:
-                base_url = COUNTRY_OPTIONS.get(country)
-                if not base_url:
-                    errors["country"] = "invalid_country"
-                else:
-                    token_res = await self.hass.async_add_executor_job(fetch_token, base_url, username, password)
-                    if not isinstance(token_res, TokenSuccess):
-                        errors["base"] = "auth_failed"
-                    else:
-                        new_data = {"country": country, "username": username, "password": password}
-                        self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
-                        return self.async_create_entry(title="", data={})
+            country = user_input[CONF_COUNTRY]
+            username = user_input["username"]
+            password = user_input["password"]
+            base_url = (user_input.get(CONF_BASE_URL) or "").strip() or COUNTRY_OPTIONS[
+                country
+            ]
 
-        schema = vol.Schema(
-            {
-                vol.Required("country", default=current.get("country", DEFAULT_COUNTRY)): vol.In(list(COUNTRY_OPTIONS.keys())),
-                vol.Required("username", default=current.get("username", "")): str,
-                vol.Required("password"): str,
-            }
+            error = await _async_validate(self.hass, base_url, username, password)
+            if error:
+                errors["base"] = error
+            else:
+                self.hass.config_entries.async_update_entry(
+                    entry,
+                    data={
+                        CONF_COUNTRY: country,
+                        CONF_BASE_URL: base_url,
+                        "username": username,
+                        "password": password,
+                    },
+                )
+                return self.async_create_entry(title="", data={})
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=_credentials_schema(
+                country=stored.get(CONF_COUNTRY),
+                username=stored.get("username", ""),
+                base_url=stored.get(CONF_BASE_URL),
+            ),
+            errors=errors,
         )
-        return self.async_show_form(step_id="init", data_schema=schema, errors=errors)
