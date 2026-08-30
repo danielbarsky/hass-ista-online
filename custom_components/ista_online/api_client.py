@@ -13,13 +13,22 @@ Changes in this fork:
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
 
 from .const import REQUEST_TIMEOUT_SECONDS
+
+# ista's backend intermittently answers with an ASP.NET "Runtime Error"
+# page instead of JSON. Observed twice in two days, clearing on its own
+# both times, so a couple of retries turns an outage into a hiccup.
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (1.0, 3.0)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +43,20 @@ class IstaApiError(Exception):
 
 class IstaAuthError(IstaApiError):
     """Credentials were rejected, or the token is no longer valid."""
+
+
+def _summarize_body(text: str, limit: int = 180) -> str:
+    """Condense an error body for logging - HTML error pages are enormous."""
+    stripped = text.strip()
+    if stripped[:200].lstrip().lower().startswith(("<!doctype", "<html")):
+        title = re.search(r"<title[^>]*>(.*?)</title>", stripped, re.S | re.I)
+        label = title.group(1).strip() if title else "HTML page"
+        # Drop style/script contents first, or the summary is mostly CSS.
+        body = re.sub(r"<(style|script)[^>]*>.*?</\1>", " ", stripped, flags=re.S | re.I)
+        body = re.sub(r"<[^>]+>", " ", body)
+        body = " ".join(body.split())
+        return f"{label}: {body[:limit]}"
+    return " ".join(stripped.split())[:limit]
 
 
 def _parse_utc_z(dt_str: Any) -> datetime | None:
@@ -102,33 +125,65 @@ async def _request_json(
     *,
     headers: dict[str, str] | None = None,
     data: dict[str, str] | None = None,
-) -> Any:
-    """Issue a request and return decoded JSON, raising typed errors."""
+) -> tuple[int, Any]:
+    """Issue a request and return (status, decoded JSON), raising typed errors.
+
+    Retries transport failures, timeouts, 5xx responses and non-JSON bodies.
+    A 4xx is definitive and is never retried: 401 means the token is stale and
+    the coordinator handles it, 400 means the credentials are wrong.
+
+    Every error names the URL, because "response was not JSON" is useless
+    without knowing which of three endpoints produced it.
+    """
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
-    try:
-        async with session.request(
-            method, url, headers=headers, data=data, timeout=timeout
-        ) as resp:
-            status = resp.status
-            # ista serves JSON with assorted content types; don't be strict.
-            try:
-                payload = await resp.json(content_type=None)
-            except ValueError:
+    last_error: IstaApiError | None = None
+
+    for attempt in range(RETRY_ATTEMPTS):
+        if attempt:
+            delay = RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
+            _LOGGER.debug(
+                "Retrying %s in %.0fs (attempt %d/%d): %s",
+                url, delay, attempt + 1, RETRY_ATTEMPTS, last_error,
+            )
+            await asyncio.sleep(delay)
+
+        try:
+            async with session.request(
+                method, url, headers=headers, data=data, timeout=timeout
+            ) as resp:
+                status = resp.status
                 text = await resp.text()
-                if status == 401:
-                    raise IstaAuthError("Unauthorized", status)
-                raise IstaApiError(
-                    f"HTTP {status}: response was not JSON ({text[:200]})", status
-                )
-    except aiohttp.ClientError as err:
-        raise IstaApiError(f"Request to {url} failed: {err}") from err
-    except TimeoutError as err:
-        raise IstaApiError(f"Request to {url} timed out") from err
+        except aiohttp.ClientError as err:
+            last_error = IstaApiError(f"{url}: request failed: {err}")
+            continue
+        except TimeoutError:
+            last_error = IstaApiError(f"{url}: request timed out")
+            continue
 
-    if status == 401:
-        raise IstaAuthError("Unauthorized", status)
+        # 401 is definitive - the coordinator refreshes the token and retries.
+        if status == 401:
+            raise IstaAuthError(f"{url}: unauthorized", status)
 
-    return status, payload
+        try:
+            payload = json.loads(text) if text else None
+        except ValueError:
+            last_error = IstaApiError(
+                f"{url}: HTTP {status} was not JSON ({_summarize_body(text)})", status
+            )
+            if 400 <= status < 500:
+                raise last_error
+            continue
+
+        if status >= 500:
+            last_error = IstaApiError(
+                f"{url}: HTTP {status} ({_summarize_body(text)})", status
+            )
+            continue
+
+        return status, payload
+
+    assert last_error is not None
+    raise last_error
 
 
 async def async_fetch_token(
@@ -149,7 +204,7 @@ async def async_fetch_token(
     )
 
     if not isinstance(payload, dict):
-        raise IstaApiError("Unexpected token response shape", status)
+        raise IstaApiError(f"{url}: unexpected token response shape", status)
 
     if "error" in payload:
         error = payload.get("error")
@@ -160,7 +215,7 @@ async def async_fetch_token(
 
     token = TokenSuccess(payload)
     if not token.access_token:
-        raise IstaApiError("Token response contained no access_token", status)
+        raise IstaApiError(f"{url}: token response contained no access_token", status)
     return token
 
 
