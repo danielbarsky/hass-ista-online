@@ -4,43 +4,49 @@
     "step": {
       "user": {
         "title": "ISTA Online account",
-        "description": "Enter your ISTA credentials. Two-factor authentication must be disabled on the ISTA account for this integration to work.",
+        "description": "Enter your ISTA Denmark credentials. Two-factor authentication must be disabled on the ISTA account, because the portal only offers a password grant.",
         "data": {
           "country": "Country",
           "username": "Username",
-          "password": "Password"
+          "password": "Password",
+          "base_url": "API base URL (change only if the endpoint moves)"
         }
       },
-      "reauth": {
-        "title": "Reauthenticate ISTA Online account",
-        "description": "Your credentials are invalid or expired. Provide updated username and password. Two-factor authentication must be disabled.",
+      "reauth_confirm": {
+        "title": "Reauthenticate ISTA Online",
+        "description": "Your ISTA credentials were rejected. Enter them again to reconnect.",
         "data": {
-          "username": "Username",
-          "password": "Password"
-        }
-      },
-      "init": {
-        "title": "Update ISTA Online credentials",
-        "description": "Change username, password or country. Two-factor authentication must be disabled.",
-        "data": {
-          "country": "Country",
           "username": "Username",
           "password": "Password"
         }
       }
+    },
+    "error": {
+      "invalid_auth": "Username or password was rejected by ISTA.",
+      "cannot_connect": "Could not reach the ISTA API. Check the base URL and your network."
+    },
+    "abort": {
+      "already_configured": "This ISTA account is already set up.",
+      "reauth_successful": "ISTA Online reconnected successfully.",
+      "reauth_entry_missing": "Could not find the configuration entry to reauthenticate."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Update ISTA Online credentials",
-        "description": "Change username, password or country. Two-factor authentication must be disabled.",
+        "title": "Update ISTA Online settings",
+        "description": "Change the credentials or the API endpoint for this account.",
         "data": {
           "country": "Country",
           "username": "Username",
-          "password": "Password"
+          "password": "Password",
+          "base_url": "API base URL"
         }
       }
+    },
+    "error": {
+      "invalid_auth": "Username or password was rejected by ISTA.",
+      "cannot_connect": "Could not reach the ISTA API. Check the base URL and your network."
     }
   }
 }

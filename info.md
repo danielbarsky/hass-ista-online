@@ -1,1 +1,0 @@
-Custom integration for ISTA Denmark. Allows fetching of meter readings and consumption, representing each meter as a Home Assistant device with diagnostic sensors.

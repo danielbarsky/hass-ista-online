@@ -1,6 +1,6 @@
 {
-  "name": "ISTA Online",
+  "name": "ISTA Online (DK)",
   "content_in_root": false,
-  "homeassistant": "2023.12.0",
+  "homeassistant": "2024.11.0",
   "country": "DK"
 }
